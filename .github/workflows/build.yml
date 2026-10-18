@@ -38,10 +38,13 @@ jobs:
           cargo metadata --format-version 1 > /dev/null
           cargo test --locked -p codex-mcp
           cargo build --locked -p codex-cli --bin codex
+          strip --strip-unneeded target/debug/codex
           file target/debug/codex
+          test "$(stat -c%s target/debug/codex)" -le 450000000
           mkdir -p "$GITHUB_WORKSPACE/artifact"
           install -m 0755 target/debug/codex "$GITHUB_WORKSPACE/artifact/codex"
-          sha256sum "$GITHUB_WORKSPACE/artifact/codex" > "$GITHUB_WORKSPACE/artifact/codex.sha256"
+          cd "$GITHUB_WORKSPACE/artifact"
+          sha256sum codex > codex.sha256
 
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
