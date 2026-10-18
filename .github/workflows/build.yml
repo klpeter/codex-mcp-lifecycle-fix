@@ -35,6 +35,7 @@ jobs:
           git -C "$RUNNER_TEMP/codex" apply --check "$GITHUB_WORKSPACE/codex-0.160.0-mcpfix.patch"
           git -C "$RUNNER_TEMP/codex" apply "$GITHUB_WORKSPACE/codex-0.160.0-mcpfix.patch"
           cd "$RUNNER_TEMP/codex/codex-rs"
+          cargo metadata --format-version 1 > /dev/null
           cargo test --locked -p codex-mcp
           cargo build --locked -p codex-cli --bin codex
           file target/debug/codex
