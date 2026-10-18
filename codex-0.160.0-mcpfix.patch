@@ -1,0 +1,253 @@
+diff --git a/codex-rs/codex-mcp/src/connection_manager.rs b/codex-rs/codex-mcp/src/connection_manager.rs
+index ad4fbf4..4e4cb97 100644
+--- a/codex-rs/codex-mcp/src/connection_manager.rs
++++ b/codex-rs/codex-mcp/src/connection_manager.rs
+@@ -155,6 +155,14 @@ impl McpServerConnection {
+ impl Drop for McpServerConnection {
+     fn drop(&mut self) {
+         self.client.cancel_token.cancel();
++        if self.client.startup_complete.load(Ordering::Acquire)
++            && let Ok(runtime) = tokio::runtime::Handle::try_current()
++        {
++            let client = self.client.clone();
++            runtime.spawn(async move {
++                client.shutdown().await;
++            });
++        }
+     }
+ }
+ 
+diff --git a/codex-rs/codex-mcp/src/connection_manager_tests.rs b/codex-rs/codex-mcp/src/connection_manager_tests.rs
+index 0152405..22c248f 100644
+--- a/codex-rs/codex-mcp/src/connection_manager_tests.rs
++++ b/codex-rs/codex-mcp/src/connection_manager_tests.rs
+@@ -56,6 +56,7 @@ use codex_protocol::protocol::GranularApprovalConfig;
+ use codex_protocol::protocol::McpStartupFailureReason;
+ use codex_rmcp_client::ElicitationResponse;
+ use codex_rmcp_client::InProcessTransportFactory;
++use codex_rmcp_client::LocalStdioServerLauncher;
+ use codex_rmcp_client::McpAuthState;
+ use codex_rmcp_client::McpLoginRequirement;
+ use codex_rmcp_client::McpOAuthRefreshMode;
+@@ -85,6 +86,7 @@ use rmcp::model::Tool;
+ use rmcp::service::RequestContext;
+ use std::collections::HashMap;
+ use std::collections::HashSet;
++use std::ffi::OsString;
+ use std::io;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+@@ -565,6 +567,213 @@ pub(crate) async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> A
+     }
+ }
+ 
++#[tokio::test]
++async fn dropping_last_mcp_connection_owner_shuts_down_ready_client() -> anyhow::Result<()> {
++    let client = Arc::new(
++        RmcpClient::new_in_process_client(Arc::new(RefreshTestTransportFactory {
++            tool: create_test_tool("lifecycle", "echo").tool,
++            list_started: None,
++            release_list: None,
++            next_cursor: None,
++            list_requests: Arc::new(AtomicUsize::new(0)),
++        }))
++        .await?,
++    );
++    client
++        .initialize(
++            InitializeRequestParams::new(
++                ClientCapabilities::default(),
++                Implementation::new("codex-test", "0.0.0-test"),
++            )
++            .with_protocol_version(ProtocolVersion::V_2025_06_18),
++            Some(Duration::from_secs(5)),
++            Box::new(|_, _| async { Err(anyhow!("unexpected elicitation")) }.boxed()),
++        )
++        .await?;
++    let tools = list_tools_for_client_uncached(
++        "lifecycle",
++        /*is_codex_apps_mcp_server*/ false,
++        "test",
++        &client,
++        Some(Duration::from_secs(5)),
++        crate::pagination::MAX_MCP_CATALOG_ITEMS,
++        /*server_instructions*/ None,
++    )
++    .await?;
++    let managed_client = ManagedClient {
++        _auth_change_notifications: None,
++        client: Arc::clone(&client),
++        server_info: create_test_server_info("Lifecycle"),
++        tool_catalog: Arc::new(ClientToolCatalog::new(tools, /*updates*/ None)),
++        tool_timeout: None,
++        server_instructions: None,
++        server_supports_sandbox_state_meta_capability: false,
++        codex_apps_tools_cache_context: None,
++    };
++    let async_client = AsyncManagedClient {
++        client: futures::future::ready(Ok(managed_client)).boxed().shared(),
++        is_codex_apps_mcp_server: false,
++        server_capabilities: Arc::new(std::sync::Mutex::new(None)),
++        cached_server_info: None,
++        codex_apps_tools_cache_context: None,
++        tool_catalog_cache_context: None,
++        startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
++        startup_reconnect: None,
++        cancel_token: CancellationToken::new(),
++    };
++    let mut manager = McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true);
++    manager.insert_test_client("lifecycle", async_client);
++    let manager = Arc::new(manager);
++    let binding = capture_binding(&manager).await;
++
++    assert!(!client.is_closed().await);
++    drop(manager);
++    assert!(
++        !client.is_closed().await,
++        "the live binding retains its owner"
++    );
++    drop(binding);
++    tokio::time::timeout(Duration::from_secs(1), async {
++        while !client.is_closed().await {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .expect("dropping the last binding should shut down the ready MCP client");
++    Ok(())
++}
++
++#[cfg(target_os = "linux")]
++#[tokio::test]
++async fn dropping_last_stdio_mcp_connection_owner_terminates_child_process() -> anyhow::Result<()> {
++    let temp_dir = tempdir()?;
++    let pid_file = temp_dir.path().join("mcp-child.pid");
++    let server = r#"
++import json, os, sys, time
++with open(sys.argv[1], "w") as pid_file:
++    pid_file.write(str(os.getpid()))
++    pid_file.flush()
++for line in sys.stdin:
++    request = json.loads(line)
++    method = request.get("method")
++    if method == "initialize":
++        result = {"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"lifecycle-smoke","version":"0"}}
++    elif method == "tools/list":
++        result = {"tools":[]}
++    else:
++        continue
++    print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
++# Intentionally survive stdin EOF; only explicit process termination should stop us.
++while True:
++    time.sleep(1)
++"#;
++    let client = Arc::new(
++        RmcpClient::new_stdio_client(
++            OsString::from("python3"),
++            vec![
++                OsString::from("-u"),
++                OsString::from("-c"),
++                OsString::from(server),
++                pid_file.as_os_str().to_owned(),
++            ],
++            None,
++            &[],
++            None,
++            Arc::new(LocalStdioServerLauncher::new(std::env::current_dir()?)),
++        )
++        .await?,
++    );
++    client
++        .initialize(
++            InitializeRequestParams::new(
++                ClientCapabilities::default(),
++                Implementation::new("codex-test", "0.0.0-test"),
++            )
++            .with_protocol_version(ProtocolVersion::V_2025_06_18),
++            Some(Duration::from_secs(5)),
++            Box::new(|_, _| async { Err(anyhow!("unexpected elicitation")) }.boxed()),
++        )
++        .await?;
++    let tools = list_tools_for_client_uncached(
++        "lifecycle",
++        /*is_codex_apps_mcp_server*/ false,
++        "test",
++        &client,
++        Some(Duration::from_secs(5)),
++        crate::pagination::MAX_MCP_CATALOG_ITEMS,
++        /*server_instructions*/ None,
++    )
++    .await?;
++    let pid = tokio::time::timeout(Duration::from_secs(2), async {
++        loop {
++            if let Ok(pid) = std::fs::read_to_string(&pid_file)
++                && let Ok(pid) = pid.parse::<u32>()
++            {
++                break pid;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await?;
++
++    let managed_client = ManagedClient {
++        _auth_change_notifications: None,
++        client: Arc::clone(&client),
++        server_info: create_test_server_info("Lifecycle"),
++        tool_catalog: Arc::new(ClientToolCatalog::new(tools, /*updates*/ None)),
++        tool_timeout: None,
++        server_instructions: None,
++        server_supports_sandbox_state_meta_capability: false,
++        codex_apps_tools_cache_context: None,
++        tool_catalog_cache_context: None,
++    };
++    let async_client = AsyncManagedClient {
++        client: futures::future::ready(Ok(managed_client)).boxed().shared(),
++        is_codex_apps_mcp_server: false,
++        server_capabilities: Arc::new(std::sync::Mutex::new(None)),
++        cached_server_info: None,
++        codex_apps_tools_cache_context: None,
++        tool_catalog_cache_context: None,
++        startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
++        startup_reconnect: None,
++        cancel_token: CancellationToken::new(),
++    };
++    let mut manager = McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true);
++    manager.insert_test_client("lifecycle", async_client);
++    let manager = Arc::new(manager);
++    let binding = capture_binding(&manager).await;
++
++    assert!(
++        linux_process_is_running(pid),
++        "MCP child should be alive while bound"
++    );
++    drop(manager);
++    assert!(
++        linux_process_is_running(pid),
++        "the live binding retains the owner"
++    );
++    drop(binding);
++    tokio::time::timeout(Duration::from_secs(5), async {
++        while linux_process_is_running(pid) {
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++    })
++    .await
++    .expect("dropping the last binding should terminate the MCP child process");
++    Ok(())
++}
++
++#[cfg(target_os = "linux")]
++fn linux_process_is_running(pid: u32) -> bool {
++    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
++        return false;
++    };
++    status
++        .rsplit_once(')')
++        .and_then(|(_, fields)| fields.split_whitespace().next())
++        .is_some_and(|state| state != "Z")
++}
++
+ #[tokio::test]
+ async fn connection_statuses_observe_clients_without_starting_them() {
+     use codex_protocol::mcp::McpServerConnectionStatus as Status;

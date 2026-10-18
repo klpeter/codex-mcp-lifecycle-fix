@@ -1,0 +1,51 @@
+name: Build Codex MCP lifecycle fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      UPSTREAM_COMMIT: a956835d020762cb2b570053af06f643a11c0ecc
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcap-dev libasound2-dev
+
+      - name: Apply patch, run MCP tests, and build Codex
+        run: |
+          git clone --depth 1 --branch rust-v0.160.0 https://github.com/openai/codex.git "$RUNNER_TEMP/codex"
+          test "$(git -C "$RUNNER_TEMP/codex" rev-parse HEAD)" = "$UPSTREAM_COMMIT"
+          git -C "$RUNNER_TEMP/codex" apply --check "$GITHUB_WORKSPACE/codex-0.160.0-mcpfix.patch"
+          git -C "$RUNNER_TEMP/codex" apply "$GITHUB_WORKSPACE/codex-0.160.0-mcpfix.patch"
+          cd "$RUNNER_TEMP/codex/codex-rs"
+          cargo test --locked -p codex-mcp
+          cargo build --locked -p codex-cli --bin codex
+          file target/debug/codex
+          mkdir -p "$GITHUB_WORKSPACE/artifact"
+          install -m 0755 target/debug/codex "$GITHUB_WORKSPACE/artifact/codex"
+          sha256sum "$GITHUB_WORKSPACE/artifact/codex" > "$GITHUB_WORKSPACE/artifact/codex.sha256"
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-0.160.0-mcpfix-linux-x86_64
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
