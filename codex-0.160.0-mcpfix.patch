@@ -18,7 +18,7 @@ index ad4fbf4..4e4cb97 100644
  }
  
 diff --git a/codex-rs/codex-mcp/src/connection_manager_tests.rs b/codex-rs/codex-mcp/src/connection_manager_tests.rs
-index 0152405..22c248f 100644
+index 0152405..2d8393e 100644
 --- a/codex-rs/codex-mcp/src/connection_manager_tests.rs
 +++ b/codex-rs/codex-mcp/src/connection_manager_tests.rs
 @@ -56,6 +56,7 @@ use codex_protocol::protocol::GranularApprovalConfig;
@@ -37,7 +37,7 @@ index 0152405..22c248f 100644
  use std::io;
  use std::path::PathBuf;
  use std::sync::Arc;
-@@ -565,6 +567,213 @@ pub(crate) async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> A
+@@ -565,6 +567,212 @@ pub(crate) async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> A
      }
  }
  
@@ -199,7 +199,6 @@ index 0152405..22c248f 100644
 +        server_instructions: None,
 +        server_supports_sandbox_state_meta_capability: false,
 +        codex_apps_tools_cache_context: None,
-+        tool_catalog_cache_context: None,
 +    };
 +    let async_client = AsyncManagedClient {
 +        client: futures::future::ready(Ok(managed_client)).boxed().shared(),
